@@ -1,0 +1,14 @@
+{
+  "name": "asoogak-catalogue-scanner",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Distributed multi-IP stream manifest verifier and episode scanner for AsooGak Smart TV",
+  "scripts": {
+    "scan": "node scan-shard.mjs",
+    "merge": "node merge-catalogue.mjs"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3"
+  }
+}

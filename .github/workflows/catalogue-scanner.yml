@@ -1,0 +1,105 @@
+name: AsooGak Distributed Catalogue & Episode Scanner
+
+on:
+  schedule:
+    - cron: '15 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: 'Scan duration per parallel shard (seconds)'
+        required: false
+        default: '180'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: asoogak-catalogue-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan-shards:
+    name: Scan Shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - name: Checkout scanner
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Run Multi-IP Shard Verification & Discovery
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: '8'
+          SCAN_DURATION_MS: ${{ (github.event.inputs.duration_seconds || 180) * 1000 }}
+          TMDB_KEY: ${{ secrets.TMDB_KEY }}
+          RESOLVER_KEY: ${{ secrets.RESOLVER_KEY }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          EXISTING_CATALOGUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/catalogue-data/catalogue.json
+          STATE_URL: https://raw.githubusercontent.com/${{ github.repository }}/catalogue-data/scanner-state.json
+        run: node scan-shard.mjs
+
+      - name: Upload Shard Output
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-output-${{ matrix.shard }}
+          path: shard-output-${{ matrix.shard }}.json
+          retention-days: 1
+
+  merge-and-publish:
+    name: Merge Shards & Publish CDN Snapshot
+    needs: scan-shards
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout scanner
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Download All Shard Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Merge Shards with Cloudflare & Existing Catalogue
+        env:
+          ARTIFACTS_DIR: artifacts
+          OUTPUT_DIR: dist
+          AVAILABILITY_API: ${{ secrets.AVAILABILITY_API }}
+          EXISTING_CATALOGUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/catalogue-data/catalogue.json
+          STATE_URL: https://raw.githubusercontent.com/${{ github.repository }}/catalogue-data/scanner-state.json
+        run: node merge-catalogue.mjs
+
+      - name: Publish Catalogue Snapshot to catalogue-data Branch
+        run: |
+          cd dist
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b catalogue-data
+          git add catalogue.json scanner-state.json
+          git commit -m "Update verified catalogue snapshot ($(date -u +'%Y-%m-%dT%H:%M:%SZ'))"
+          git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" catalogue-data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
