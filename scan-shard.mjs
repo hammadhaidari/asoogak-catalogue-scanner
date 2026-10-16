@@ -3,16 +3,17 @@ import { Buffer } from 'node:buffer';
 import nacl from 'tweetnacl';
 
 const SHARD_INDEX = Math.max(0, Number(process.env.SHARD_INDEX || 0));
-const SHARD_TOTAL = Math.max(1, Number(process.env.SHARD_TOTAL || 8));
-const SCAN_DURATION_MS = Math.max(30000, Number(process.env.SCAN_DURATION_MS || 210000));
-const RECHECK_AGE_MS = Math.max(6 * 3600000, Number(process.env.RECHECK_AGE_MS || 24 * 3600000));
-const NEGATIVE_RECHECK_MS = 48 * 3600000;
+const SHARD_TOTAL = Math.max(1, Number(process.env.SHARD_TOTAL || 16));
+const SCAN_DURATION_MS = Math.max(30000, Number(process.env.SCAN_DURATION_MS || 240000));
+const RECHECK_AGE_MS = Math.max(6 * 3600000, Number(process.env.RECHECK_AGE_MS || 48 * 3600000));
+const NEGATIVE_RECHECK_MS = 72 * 3600000;
 const WORKER_CONCURRENCY = Math.max(1, Number(process.env.WORKER_CONCURRENCY || 3));
-const CHECK_PACE_MS = Math.max(250, Number(process.env.CHECK_PACE_MS || 650));
+const CHECK_PACE_MS = Math.max(250, Number(process.env.CHECK_PACE_MS || 600));
 
 const TMDB_KEY = (process.env.TMDB_KEY || '').trim();
 const RESOLVER_KEY = (process.env.RESOLVER_KEY || '').trim();
-const PROXY_URL = (process.env.PROXY_URL || '').trim();
+const PROXY_URLS = (process.env.PROXY_URL || '').split(',').map(s => s.trim()).filter(Boolean);
+let proxyCursor = SHARD_INDEX;
 const EXISTING_CATALOGUE_URL = (process.env.EXISTING_CATALOGUE_URL || '').trim();
 const STATE_URL = (process.env.STATE_URL || '').trim();
 
@@ -84,8 +85,9 @@ async function fetchWithFallback(targetUrl, headers, timeoutMs = 10000) {
         if (direct.ok || direct.status === 206 || direct.status === 404 || direct.status === 410) return direct;
         await direct.body?.cancel();
     } catch (err) {}
-    if (PROXY_URL) {
-        const proxied = PROXY_URL + encodeURIComponent(targetUrl) + '&base=' + encodeURIComponent('https://vidlink.pro');
+    if (PROXY_URLS.length) {
+        const proxyBase = PROXY_URLS[proxyCursor++ % PROXY_URLS.length];
+        const proxied = proxyBase + encodeURIComponent(targetUrl) + '&base=' + encodeURIComponent('https://vidlink.pro');
         return fetch(proxied, { headers, signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
     }
     throw new Error('Request failed');
@@ -153,22 +155,49 @@ export async function verifyStreamKey(key, secret) {
 export function discoveryFeed(counter) {
     const step = Math.max(0, counter - 1);
     const type = step % 3 === 2 ? 'tv' : 'movie';
-    const ordinal = type === 'tv' ? Math.floor(step / 3) : step - Math.floor(step / 3);
+    const rawOrdinal = type === 'tv' ? Math.floor(step / 3) : step - Math.floor(step / 3);
+    const ordinal = rawOrdinal % 17000;
+    // Tier 1 (0..1999): Global sort partitions (500 pages each = 40,000 candidates per type)
     if (ordinal < 2000) {
         const partition = Math.floor(ordinal / 500);
         const page = (ordinal % 500) + 1;
         const sorts = ['popularity.desc', 'vote_count.desc', type === 'tv' ? 'first_air_date.desc' : 'primary_release_date.desc', 'vote_average.desc'];
-        const votes = partition === 0 ? (type === 'tv' ? 30 : 50) : partition === 1 ? (type === 'tv' ? 10 : 15) : partition === 2 ? 5 : 10;
+        const votes = partition === 0 ? (type === 'tv' ? 15 : 25) : partition === 1 ? (type === 'tv' ? 5 : 10) : partition === 2 ? 2 : 5;
         return { type, path: '/discover/' + type + '?sort_by=' + sorts[partition] + '&include_adult=false&without_genres=16,10767,10763&vote_count.gte=' + votes + '&page=' + page };
     }
-    const yearStep = ordinal - 2000;
-    const page = (yearStep % 25) + 1;
-    const yearOffset = Math.floor(yearStep / 25);
-    const year = Math.max(1970, new Date().getFullYear() - yearOffset);
+    // Tier 2 (2000..7699): Deep year-by-year sweep (76 years x 75 pages = 114,000 candidates per type)
+    if (ordinal < 7700) {
+        const yearStep = ordinal - 2000;
+        const page = (yearStep % 75) + 1;
+        const yearOffset = Math.floor(yearStep / 75);
+        const year = Math.max(1950, new Date().getFullYear() - yearOffset);
+        return {
+            type,
+            path: '/discover/' + type + '?sort_by=popularity.desc&include_adult=false&without_genres=16,10767,10763&vote_count.gte=2&page=' + page +
+                '&' + (type === 'tv' ? 'first_air_date_year' : 'primary_release_year') + '=' + year
+        };
+    }
+    // Tier 3 (7700..12499): Genre-by-genre deep sweep (16 genres x 300 pages = 96,000 candidates per type)
+    if (ordinal < 12500) {
+        const genreStep = ordinal - 7700;
+        const movieGenres = [28, 12, 35, 80, 18, 14, 36, 27, 9648, 10749, 878, 53, 10752, 37, 10751, 99];
+        const tvGenres = [10759, 35, 80, 18, 9648, 10765, 10768, 37, 10751, 99, 10766, 10762, 10759, 18, 80, 10765];
+        const genres = type === 'tv' ? tvGenres : movieGenres;
+        const genreId = genres[Math.floor(genreStep / 300) % genres.length];
+        const page = (genreStep % 300) + 1;
+        return {
+            type,
+            path: '/discover/' + type + '?sort_by=popularity.desc&include_adult=false&without_genres=16,10767,10763&with_genres=' + genreId + '&vote_count.gte=2&page=' + page
+        };
+    }
+    // Tier 4 (12500..16999): International cinema & series sweep (18 languages x 250 pages)
+    const langStep = ordinal - 12500;
+    const langs = ['en', 'ko', 'es', 'fr', 'ja', 'hi', 'de', 'it', 'pt', 'tr', 'zh', 'th', 'pl', 'sv', 'da', 'no', 'nl', 'tl'];
+    const lang = langs[Math.floor(langStep / 250) % langs.length];
+    const page = (langStep % 250) + 1;
     return {
         type,
-        path: '/discover/' + type + '?sort_by=popularity.desc&include_adult=false&without_genres=16,10767,10763&vote_count.gte=5&page=' + page +
-            '&' + (type === 'tv' ? 'first_air_date_year' : 'primary_release_year') + '=' + year
+        path: '/discover/' + type + '?sort_by=popularity.desc&include_adult=false&without_genres=16,10767,10763&with_original_language=' + lang + '&vote_count.gte=2&page=' + page
     };
 }
 
@@ -196,7 +225,7 @@ async function runShard() {
     const outputItems = {};
     const stats = { shard: SHARD_INDEX, checked: 0, verified: 0, failed: 0, rechecked: 0, episodesVerified: 0, rateLimited: 0 };
 
-    // 1. Collect stale titles assigned to this shard for 24-hour freshness re-verification
+    // 1. Collect stale titles assigned to this shard for rolling freshness re-verification
     const now = Date.now();
     const recheckQueue = [];
     for (const [key, item] of knownItemsMap.entries()) {

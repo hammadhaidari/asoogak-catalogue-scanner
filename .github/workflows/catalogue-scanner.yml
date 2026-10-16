@@ -2,13 +2,13 @@ name: AsooGak Distributed Catalogue & Episode Scanner
 
 on:
   schedule:
-    - cron: '15 */2 * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       duration_ms:
         description: 'Scan duration per parallel shard (milliseconds)'
         required: false
-        default: '180000'
+        default: '240000'
 
 permissions:
   contents: write
@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     steps:
       - name: Checkout scanner
         uses: actions/checkout@v4
@@ -42,13 +42,13 @@ jobs:
       - name: Run Multi-IP Shard Verification & Discovery
         env:
           SHARD_INDEX: ${{ matrix.shard }}
-          SHARD_TOTAL: '8'
-          SCAN_DURATION_MS: ${{ github.event.inputs.duration_ms || '180000' }}
+          SHARD_TOTAL: '16'
+          SCAN_DURATION_MS: ${{ github.event.inputs.duration_ms || '240000' }}
           TMDB_KEY: ${{ secrets.TMDB_KEY }}
           RESOLVER_KEY: ${{ secrets.RESOLVER_KEY }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
-          EXISTING_CATALOGUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/catalogue-data/catalogue.json
-          STATE_URL: https://raw.githubusercontent.com/${{ github.repository }}/catalogue-data/scanner-state.json
+          EXISTING_CATALOGUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/catalogue-data/catalogue.json
+          STATE_URL: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/catalogue-data/scanner-state.json
         run: node scan-shard.mjs
 
       - name: Upload Shard Output
@@ -87,8 +87,8 @@ jobs:
           ARTIFACTS_DIR: artifacts
           OUTPUT_DIR: dist
           AVAILABILITY_API: ${{ secrets.AVAILABILITY_API }}
-          EXISTING_CATALOGUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/catalogue-data/catalogue.json
-          STATE_URL: https://raw.githubusercontent.com/${{ github.repository }}/catalogue-data/scanner-state.json
+          EXISTING_CATALOGUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/catalogue-data/catalogue.json
+          STATE_URL: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/catalogue-data/scanner-state.json
         run: node merge-catalogue.mjs
 
       - name: Publish Catalogue Snapshot to catalogue-data Branch
@@ -103,3 +103,4 @@ jobs:
           git push --force "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" catalogue-data
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
