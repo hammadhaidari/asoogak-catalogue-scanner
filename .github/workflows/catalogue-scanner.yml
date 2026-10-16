@@ -5,10 +5,10 @@ on:
     - cron: '15 */2 * * *'
   workflow_dispatch:
     inputs:
-      duration_seconds:
-        description: 'Scan duration per parallel shard (seconds)'
+      duration_ms:
+        description: 'Scan duration per parallel shard (milliseconds)'
         required: false
-        default: '180'
+        default: '180000'
 
 permissions:
   contents: write
@@ -43,7 +43,7 @@ jobs:
         env:
           SHARD_INDEX: ${{ matrix.shard }}
           SHARD_TOTAL: '8'
-          SCAN_DURATION_MS: ${{ (github.event.inputs.duration_seconds || 180) * 1000 }}
+          SCAN_DURATION_MS: ${{ github.event.inputs.duration_ms || '180000' }}
           TMDB_KEY: ${{ secrets.TMDB_KEY }}
           RESOLVER_KEY: ${{ secrets.RESOLVER_KEY }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
