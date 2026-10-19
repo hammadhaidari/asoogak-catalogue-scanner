@@ -97,7 +97,8 @@ export async function verifyStreamKey(key, secret) {
     const headers = {
         Referer: 'https://vidlink.pro/',
         Origin: 'https://vidlink.pro',
-        'User-Agent': 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 9.0) AppleWebKit/537.36 (KHTML, like Gecko) 120.0.6099.5/9.0 TV Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 9.0) AppleWebKit/537.36 (KHTML, like Gecko) 120.0.6099.5/9.0 TV Safari/537.36',
+        'X-Playback-Environment': 'dash-hevc'
     };
     let response;
     let reader;
@@ -115,6 +116,7 @@ export async function verifyStreamKey(key, secret) {
         if (!source || !source.url) return { ok: false };
         const target = new URL(source.url);
         if (target.protocol !== 'https:') return { ok: false };
+        if (/^hcdn\d*\.hakunaymatata\.com$/i.test(target.hostname)) target.hostname = 'hcdn5.hakunaymatata.com';
         const cookie = source.headers && (source.headers.Cookie || source.headers.cookie);
         if (cookie) {
             for (const part of cookie.split(';')) {
@@ -125,7 +127,15 @@ export async function verifyStreamKey(key, secret) {
                 if (mapped) target.searchParams.set(mapped, part.slice(sep + 1).trim());
             }
         }
-        response = await fetchWithFallback(target.href, { ...headers, Range: 'bytes=0-1024' }, 9000);
+        const isHakunaDirect = target.hostname.endsWith('hakunaymatata.com') && target.hostname !== 'sacdn.hakunaymatata.com';
+        const probeHeaders = isHakunaDirect
+            ? {
+                'User-Agent': (source.headers && (source.headers['User-Agent'] || source.headers['user-agent'])) || 'com.community.oneroom/50020115 (Linux; U; Android 15; en_US; OPPO CPH2579; Build/AP3A.240905.015.A2; Cronet/140.0.7339.51)',
+                Accept: '*/*',
+                Range: 'bytes=0-1024'
+            }
+            : { ...headers, Range: 'bytes=0-1024' };
+        response = await fetchWithFallback(target.href, probeHeaders, 9000);
         if (response.status === 429) return { rateLimited: true };
         if ([400, 403, 404, 410, 422, 428].includes(response.status)) return { ok: false };
         if (!response.ok && response.status !== 206) return {};
