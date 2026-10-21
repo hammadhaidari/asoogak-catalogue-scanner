@@ -12,20 +12,51 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: asoogak-catalogue-scanner
   cancel-in-progress: false
 
+env:
+  EXISTING_CATALOGUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/catalogue-data/catalogue.json
+  STATE_URL: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/catalogue-data/scanner-state.json
+  SCAN_DURATION_MS: ${{ github.event.inputs.duration_ms || '1200000' }}
+
 jobs:
+  # Sizes this run from measured demand vs capacity (plan.mjs): shard count auto-scales 16-20 and, beyond that,
+  # the long tail is re-checked less often instead of silently falling behind.
+  plan:
+    name: Capacity Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      shards: ${{ steps.plan.outputs.shards }}
+      recheck_age_ms: ${{ steps.plan.outputs.recheck_age_ms }}
+      recheck_age_tail_ms: ${{ steps.plan.outputs.recheck_age_tail_ms }}
+      popular_min: ${{ steps.plan.outputs.popular_min }}
+      plan_json: ${{ steps.dump.outputs.plan_json }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - id: plan
+        run: node plan.mjs
+      - id: dump
+        run: echo "plan_json=$(cat plan.json)" >> "$GITHUB_OUTPUT"
+
   scan-shards:
     name: Scan Shard ${{ matrix.shard }}
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 28
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
-        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        shard: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Checkout scanner
         uses: actions/checkout@v4
@@ -42,13 +73,13 @@ jobs:
       - name: Run Multi-IP Shard Verification & Discovery
         env:
           SHARD_INDEX: ${{ matrix.shard }}
-          SHARD_TOTAL: '16'
-          SCAN_DURATION_MS: ${{ github.event.inputs.duration_ms || '1200000' }}
+          SHARD_TOTAL: ${{ needs.plan.outputs.shards }}
+          RECHECK_AGE_MS: ${{ needs.plan.outputs.recheck_age_ms }}
+          RECHECK_AGE_TAIL_MS: ${{ needs.plan.outputs.recheck_age_tail_ms }}
+          POPULAR_MIN: ${{ needs.plan.outputs.popular_min }}
           TMDB_KEY: ${{ secrets.TMDB_KEY }}
           RESOLVER_KEY: ${{ secrets.RESOLVER_KEY }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
-          EXISTING_CATALOGUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/catalogue-data/catalogue.json
-          STATE_URL: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/catalogue-data/scanner-state.json
         run: node scan-shard.mjs
 
       - name: Upload Shard Output
@@ -60,8 +91,8 @@ jobs:
 
   merge-and-publish:
     name: Merge Shards & Publish CDN Snapshot
-    needs: scan-shards
-    if: always()
+    needs: [plan, scan-shards]
+    if: always() && needs.plan.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -87,8 +118,7 @@ jobs:
           ARTIFACTS_DIR: artifacts
           OUTPUT_DIR: dist
           AVAILABILITY_API: ${{ secrets.AVAILABILITY_API }}
-          EXISTING_CATALOGUE_URL: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/catalogue-data/catalogue.json
-          STATE_URL: https://raw.githubusercontent.com/${{ github.repository }}/refs/heads/catalogue-data/scanner-state.json
+          PLAN_JSON: ${{ needs.plan.outputs.plan_json }}
         run: node merge-catalogue.mjs
 
       - name: Publish Catalogue Snapshot to catalogue-data Branch
@@ -104,3 +134,9 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Watchdog: opens (or updates) one issue when re-verification falls behind or capacity runs out - GitHub emails
+      # the repo owner - and closes it automatically once the scanner has caught up again.
+      - name: Catch-up Watchdog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node watchdog.mjs dist/scanner-state.json

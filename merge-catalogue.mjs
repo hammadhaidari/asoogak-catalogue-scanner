@@ -139,7 +139,7 @@ async function main() {
     const shardFiles = findShardFiles(ARTIFACTS_DIR);
     const shardPayloads = [];
     const shardCursors = { ...(prevState.shardCursors || {}) };
-    const runStats = { shardsMerged: shardFiles.length, checked: 0, verified: 0, failed: 0, rechecked: 0, evicted: 0, episodesVerified: 0, seasonsChecked: 0, seasonsDead: 0, rateLimited: 0, recheckBacklog: 0, recheckLeft: 0, reasons: {} };
+    const runStats = { shardsMerged: shardFiles.length, checked: 0, verified: 0, failed: 0, rechecked: 0, evicted: 0, episodesVerified: 0, seasonsChecked: 0, seasonsDead: 0, rateLimited: 0, recheckBacklog: 0, recheckLeft: 0, overdueLeft: 0, movieTasks: 0, movieWorkMs: 0, tvTasks: 0, tvWorkMs: 0, reasons: {} };
 
     for (const file of shardFiles) {
         try {
@@ -149,7 +149,7 @@ async function main() {
                 shardCursors[payload.shard] = payload.nextCursor;
             }
             if (payload.stats) {
-                for (const name of ['checked', 'verified', 'failed', 'rechecked', 'evicted', 'episodesVerified', 'seasonsChecked', 'seasonsDead', 'rateLimited', 'recheckBacklog', 'recheckLeft']) {
+                for (const name of ['checked', 'verified', 'failed', 'rechecked', 'evicted', 'episodesVerified', 'seasonsChecked', 'seasonsDead', 'rateLimited', 'recheckBacklog', 'recheckLeft', 'overdueLeft', 'movieTasks', 'movieWorkMs', 'tvTasks', 'tvWorkMs']) {
                     runStats[name] += Number(payload.stats[name]) || 0;
                 }
                 for (const [reason, count] of Object.entries(payload.stats.reasons || {})) runStats.reasons[reason] = (runStats.reasons[reason] || 0) + (Number(count) || 0);
@@ -157,6 +157,8 @@ async function main() {
         } catch (e) {}
     }
 
+    let plan = null;
+    try { plan = JSON.parse(process.env.PLAN_JSON || 'null'); } catch (e) {}
     const merged = mergeCatalogueSources([cloudflareData, existingGitHub, ...shardPayloads], now);
 
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
@@ -169,8 +171,16 @@ async function main() {
         tvCount: merged.tvCount,
         deepVerified: merged.deepVerified,
         episodeVerdicts: merged.episodeVerdicts,
-        // Catch-up health: recheckLeft > 0 for several runs in a row means re-verification is falling behind.
-        lastRun: runStats
+        // Catch-up health: overdueLeft > 0 for several runs in a row means re-verification is falling behind.
+        lastRun: runStats,
+        // Rolling history + learned per-title costs feed plan.mjs (auto-scaling) and the watchdog issue.
+        costs: plan && plan.costs ? plan.costs : (prevState.costs || null),
+        plan: plan || null,
+        history: [...(Array.isArray(prevState.history) ? prevState.history : []), {
+            at: now, shards: runStats.shardsMerged, checked: runStats.checked, rechecked: runStats.rechecked,
+            evicted: runStats.evicted, recheckLeft: runStats.recheckLeft, overdueLeft: runStats.overdueLeft,
+            total: merged.totalPlayable, deep: merged.deepVerified
+        }].slice(-48)
     }, null, 2));
 
     console.log(`Merged catalogue ready: ${merged.totalPlayable} playable titles (${merged.movieCount} movies, ${merged.tvCount} series, ${merged.deepVerified} deep-verified, ${merged.episodeVerdicts} verified episodes). Re-check backlog ${runStats.recheckBacklog}, left ${runStats.recheckLeft}.`);

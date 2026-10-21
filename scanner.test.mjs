@@ -84,3 +84,46 @@ test('merge: deep failure beats newer shallow ok; deep series without proven sea
     const stale = mergeCatalogueSources([{ records: { 'movie:5': { ok: true, at: now - 4 * 24 * H } }, items: [{ id: 5, media_type: 'movie', title: 'Old' }] }], now);
     assert.equal(stale.items.length, 0, 'titles not re-proven within 3 days leave the catalogue');
 });
+
+import { planCapacity, MIN_SHARDS, MAX_SHARDS } from './plan.mjs';
+import { assess } from './watchdog.mjs';
+import { recheckAgeFor } from './scan-shard.mjs';
+
+test('planner: today\'s library fits at the minimum fleet with everything on 24h', () => {
+    const plan = planCapacity({ movieCount: 28000, tvCount: 8100 }, []);
+    assert.equal(plan.shards, MIN_SHARDS);
+    assert.equal(plan.recheckAgeTailMs, 24 * 3600000);
+    assert.equal(plan.health, 'ok');
+});
+
+test('planner: growth scales shards up, then stretches only the long tail, then flags over-capacity', () => {
+    const pop = n => Array.from({ length: n }, (_, i) => n - i);
+    const grown = planCapacity({ movieCount: 100000, tvCount: 30000 }, pop(130000));
+    assert.ok(grown.shards > MIN_SHARDS && grown.shards <= MAX_SHARDS, 'more shards for a bigger library');
+    const huge = planCapacity({ movieCount: 200000, tvCount: 60000 }, pop(260000));
+    assert.equal(huge.shards, MAX_SHARDS);
+    assert.ok(huge.recheckAgeTailMs > 24 * 3600000 && huge.recheckAgeTailMs <= 60 * 3600000, 'tail stretched within retention');
+    assert.ok(huge.popularMin > 0, 'popular titles keep 24h');
+    const impossible = planCapacity({ movieCount: 600000, tvCount: 200000 }, pop(800000));
+    assert.equal(impossible.health, 'over-capacity');
+});
+
+test('planner learns real per-title cost from the last run (smoothed)', () => {
+    const plan = planCapacity({ movieCount: 1000, tvCount: 100, costs: { movie: 6, tv: 25 }, lastRun: { movieTasks: 100, movieWorkMs: 1000000, tvTasks: 50, tvWorkMs: 2500000 } }, []);
+    assert.equal(plan.costs.movie, 7.2);   // 0.7*6 + 0.3*10
+    assert.equal(plan.costs.tv, 32.5);     // 0.7*25 + 0.3*50
+});
+
+test('tiered re-check age by popularity', () => {
+    assert.equal(recheckAgeFor({ popularity: 50 }, 10, 24, 48), 24);
+    assert.equal(recheckAgeFor({ popularity: 3 }, 10, 24, 48), 48);
+});
+
+test('watchdog: flags persistent overdue backlog and sudden catalogue collapse, quiet when healthy', () => {
+    const healthy = { history: [{ overdueLeft: 0, total: 36000 }, { overdueLeft: 0, total: 35900 }], plan: { health: 'ok' } };
+    assert.equal(assess(healthy).problems.length, 0);
+    const behind = { history: Array.from({ length: 5 }, () => ({ overdueLeft: 300, total: 36000 })), plan: { health: 'tight' } };
+    assert.equal(assess(behind).problems.length, 1);
+    const collapse = { history: [{ overdueLeft: 0, total: 36000 }, { overdueLeft: 0, total: 20000 }], plan: { health: 'ok' } };
+    assert.match(assess(collapse).problems[0], /shrank 44%/);
+});

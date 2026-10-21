@@ -7,6 +7,13 @@ const SHARD_TOTAL = Math.max(1, Number(process.env.SHARD_TOTAL || 16));
 const SCAN_DURATION_MS = Math.max(30000, Number(process.env.SCAN_DURATION_MS || 1200000));
 // Every listed title is re-proven daily (was 48h, and the queue was unordered so some titles waited ~4 days).
 const RECHECK_AGE_MS = Math.max(6 * 3600000, Number(process.env.RECHECK_AGE_MS || 24 * 3600000));
+// Set by plan.mjs when demand outgrows capacity: the long tail (popularity below POPULAR_MIN) is re-proven less often
+// than popular titles, but always inside the 3-day retention window.
+const RECHECK_AGE_TAIL_MS = Math.max(RECHECK_AGE_MS, Number(process.env.RECHECK_AGE_TAIL_MS || RECHECK_AGE_MS));
+const POPULAR_MIN = Number(process.env.POPULAR_MIN || 0);
+export function recheckAgeFor(item, popularMin = POPULAR_MIN, fast = RECHECK_AGE_MS, tail = RECHECK_AGE_TAIL_MS) {
+    return (Number(item && item.popularity) || 0) >= popularMin ? fast : tail;
+}
 const NEGATIVE_RECHECK_MS = 72 * 3600000;
 const WORKER_CONCURRENCY = Math.max(1, Number(process.env.WORKER_CONCURRENCY || 3));
 const CHECK_PACE_MS = Math.max(250, Number(process.env.CHECK_PACE_MS || 600));
@@ -448,10 +455,11 @@ async function runShard() {
     let cursor = Number(scannerState.shardCursors?.[SHARD_INDEX]) || (SHARD_INDEX + 1);
     const outputRecords = {};
     const outputItems = {};
-    const stats = { shard: SHARD_INDEX, checked: 0, verified: 0, failed: 0, rechecked: 0, evicted: 0, episodesVerified: 0, seasonsChecked: 0, seasonsDead: 0, rateLimited: 0, recheckBacklog: 0, recheckLeft: 0, reasons: {} };
+    const stats = { shard: SHARD_INDEX, checked: 0, verified: 0, failed: 0, rechecked: 0, evicted: 0, episodesVerified: 0, seasonsChecked: 0, seasonsDead: 0, rateLimited: 0, recheckBacklog: 0, recheckLeft: 0, overdueLeft: 0,
+        movieTasks: 0, movieWorkMs: 0, tvTasks: 0, tvWorkMs: 0, reasons: {} };
 
     // 1. Collect stale titles assigned to this shard for rolling freshness re-verification. Titles that were never
-    //    deep-verified (older scanner: manifest-only, season 1 only) go first, then oldest verdict first, so the backlog
+    //    deep-verified (older scanner: manifest-only, season 1 only) go first, then the most overdue, so the backlog
     //    is provably drained instead of re-checking whatever happens to be at the head of the map.
     const now = Date.now();
     const recheckQueue = [];
@@ -459,12 +467,16 @@ async function runShard() {
         if (hashKey(key) % SHARD_TOTAL !== SHARD_INDEX) continue;
         const deep = item.verified_v >= VERIFY_VERSION;
         const lastAt = deep ? (knownRecords[key]?.at || item.availability_at || 0) : 0;
-        if (now - lastAt >= RECHECK_AGE_MS) {
-            recheckQueue.push({ key, metadata: item, isRecheck: true, lastAt });
+        const dueAt = lastAt + recheckAgeFor(item);
+        if (now >= dueAt) {
+            recheckQueue.push({ key, metadata: item, isRecheck: true, lastAt, dueAt });
         }
     }
-    recheckQueue.sort((a, b) => a.lastAt - b.lastAt);
+    recheckQueue.sort((a, b) => a.dueAt - b.dueAt);
     stats.recheckBacklog = recheckQueue.length;
+    // Overdue = never deep-verified or more than 6h past due. While any exist, every worker re-checks (discovery waits):
+    // keeping listed titles honest always outranks adding new ones, so growth can never starve re-verification.
+    const isOverdue = task => task.lastAt === 0 || now - task.dueAt > 6 * 3600000;
 
     // 2. Discover new candidates for this shard from TMDB feeds
     const discoveryQueue = [];
@@ -600,9 +612,10 @@ async function runShard() {
                 await sleep(Math.min(5000, cooldownUntil - Date.now()));
                 continue;
             }
-            // Workers 0 and 1 drain the re-verification backlog first (oldest verdict first); worker 2 leads discovery.
+            // Overdue re-checks: all workers. On schedule: workers 0-1 re-check, worker 2 leads discovery.
             let task = null;
-            if (recheckQueue.length && (workerId < 2 || discoveryQueue.length === 0)) {
+            const overdue = recheckQueue.length && isOverdue(recheckQueue[0]);
+            if (recheckQueue.length && (overdue || workerId < 2 || discoveryQueue.length === 0)) {
                 task = recheckQueue.shift();
             } else {
                 if (discoveryQueue.length < 15) await pullMoreCandidates();
@@ -614,7 +627,14 @@ async function runShard() {
                 continue;
             }
 
-            const result = task.key.startsWith('tv:') ? await verifyShow(task) : await verifyMovie(task);
+            const taskStarted = Date.now();
+            const isShow = task.key.startsWith('tv:');
+            const result = isShow ? await verifyShow(task) : await verifyMovie(task);
+            if (typeof result === 'boolean') {
+                // Measured cost per title feeds plan.mjs, which sizes the next run's shard count from real numbers.
+                if (isShow) { stats.tvTasks++; stats.tvWorkMs += Date.now() - taskStarted; }
+                else { stats.movieTasks++; stats.movieWorkMs += Date.now() - taskStarted; }
+            }
             if (typeof result === 'boolean') {
                 stats.checked++;
                 if (task.isRecheck) {
@@ -630,6 +650,7 @@ async function runShard() {
 
     await Promise.all(Array.from({ length: WORKER_CONCURRENCY }, (_, idx) => workerLoop(idx)));
     stats.recheckLeft = recheckQueue.length; // > 0 means re-verification is NOT keeping up; surfaced in scanner-state.json
+    stats.overdueLeft = recheckQueue.filter(isOverdue).length;
 
     const outPath = `shard-output-${SHARD_INDEX}.json`;
     fs.writeFileSync(outPath, JSON.stringify({
