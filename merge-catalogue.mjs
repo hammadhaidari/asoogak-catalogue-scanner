@@ -1,8 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-const POSITIVE_RETAIN_MS = 14 * 24 * 3600000;
-const NEGATIVE_RETAIN_MS = 48 * 3600000;
+// A title must be re-proven within 3 days or it leaves the catalogue (was 14 days, so dead titles lingered for two weeks
+// whenever re-checks were inconclusive). Re-checks run every 24h, so 3 days absorbs a couple of failed runs.
+const POSITIVE_RETAIN_MS = 3 * 24 * 3600000;
+const NEGATIVE_RETAIN_MS = 72 * 3600000;
+const DEEP_VERSION = 2;
 const AVAILABILITY_API = (process.env.AVAILABILITY_API || 'https://asoogak-availability.cinejoy-tv-3274.workers.dev').trim();
 const EXISTING_CATALOGUE_URL = (process.env.EXISTING_CATALOGUE_URL || '').trim();
 const STATE_URL = (process.env.STATE_URL || '').trim();
@@ -58,23 +61,31 @@ function findShardFiles(dir) {
 export function mergeCatalogueSources(sources, now = Date.now()) {
     const mergedRecords = {};
     const mergedItemsMap = new Map();
+    const isDeep = value => Number(value && (value.v || value.verified_v)) >= DEEP_VERSION;
+    const retained = rec => { const age = now - rec.at; return age >= 0 && age < (rec.ok ? POSITIVE_RETAIN_MS : NEGATIVE_RETAIN_MS); };
 
     for (const src of sources) {
         if (!src) continue;
         for (const [key, rec] of Object.entries(src.records || {})) {
             if (!rec || typeof rec.ok !== 'boolean' || !Number.isFinite(rec.at)) continue;
+            const next = { ok: rec.ok, at: rec.at, ...(isDeep(rec) ? { v: DEEP_VERSION } : {}) };
             const prev = mergedRecords[key];
-            if (!prev || rec.at >= prev.at) {
-                mergedRecords[key] = { ok: rec.ok, at: rec.at };
-            }
+            // A retained deep (segment + identity + season) verdict outranks any shallow manifest-only verdict, even a
+            // newer one; otherwise the older/other checkers would keep re-listing titles the deep scan proved dead.
+            const nextWins = !prev ||
+                (isDeep(next) && !isDeep(prev) && retained(next)) ||
+                (isDeep(next) === isDeep(prev) && next.at >= prev.at) ||
+                (!isDeep(next) && isDeep(prev) && !retained(prev) && next.at >= prev.at);
+            if (nextWins) mergedRecords[key] = next;
         }
         for (const item of (src.items || [])) {
             if (!item || !item.id || !['movie', 'tv'].includes(item.media_type)) continue;
             const key = item.media_type + ':' + item.id;
             const prev = mergedItemsMap.get(key);
-            if (!prev || (item.availability_at || 0) >= (prev.availability_at || 0)) {
-                mergedItemsMap.set(key, { ...item });
-            }
+            const nextWins = !prev ||
+                (isDeep(item) && !isDeep(prev)) ||
+                (isDeep(item) === isDeep(prev) && (item.availability_at || 0) >= (prev.availability_at || 0));
+            if (nextWins) mergedItemsMap.set(key, { ...item });
         }
     }
 
@@ -82,8 +93,7 @@ export function mergeCatalogueSources(sources, now = Date.now()) {
     const activeRecords = {};
     let episodeVerdicts = 0;
     for (const [key, rec] of Object.entries(mergedRecords)) {
-        const age = now - rec.at;
-        if (age < 0 || age >= (rec.ok ? POSITIVE_RETAIN_MS : NEGATIVE_RETAIN_MS)) continue;
+        if (!retained(rec)) continue;
         activeRecords[key] = rec;
         if (key.includes(':s') && rec.ok) episodeVerdicts++;
     }
@@ -92,11 +102,15 @@ export function mergeCatalogueSources(sources, now = Date.now()) {
     const activeItems = [];
     let movieCount = 0;
     let tvCount = 0;
+    let deepCount = 0;
     for (const [key, item] of mergedItemsMap.entries()) {
         const verdict = activeRecords[key];
         if (!verdict || !verdict.ok) continue;
+        // A deep-verified series lists only its proven seasons; one with none proven is not playable at all.
+        if (item.media_type === 'tv' && isDeep(item) && (!Array.isArray(item.playable_seasons) || !item.playable_seasons.length)) continue;
         item.availability_at = verdict.at;
         activeItems.push(item);
+        if (isDeep(item)) deepCount++;
         if (item.media_type === 'movie') movieCount++;
         else if (item.media_type === 'tv') tvCount++;
     }
@@ -109,6 +123,7 @@ export function mergeCatalogueSources(sources, now = Date.now()) {
         totalPlayable: activeItems.length,
         movieCount,
         tvCount,
+        deepVerified: deepCount,
         episodeVerdicts,
         records: activeRecords,
         items: activeItems
@@ -124,7 +139,7 @@ async function main() {
     const shardFiles = findShardFiles(ARTIFACTS_DIR);
     const shardPayloads = [];
     const shardCursors = { ...(prevState.shardCursors || {}) };
-    const runStats = { shardsMerged: shardFiles.length, checked: 0, verified: 0, failed: 0, rechecked: 0, episodesVerified: 0 };
+    const runStats = { shardsMerged: shardFiles.length, checked: 0, verified: 0, failed: 0, rechecked: 0, evicted: 0, episodesVerified: 0, seasonsChecked: 0, seasonsDead: 0, rateLimited: 0, recheckBacklog: 0, recheckLeft: 0, reasons: {} };
 
     for (const file of shardFiles) {
         try {
@@ -134,11 +149,10 @@ async function main() {
                 shardCursors[payload.shard] = payload.nextCursor;
             }
             if (payload.stats) {
-                runStats.checked += payload.stats.checked || 0;
-                runStats.verified += payload.stats.verified || 0;
-                runStats.failed += payload.stats.failed || 0;
-                runStats.rechecked += payload.stats.rechecked || 0;
-                runStats.episodesVerified += payload.stats.episodesVerified || 0;
+                for (const name of ['checked', 'verified', 'failed', 'rechecked', 'evicted', 'episodesVerified', 'seasonsChecked', 'seasonsDead', 'rateLimited', 'recheckBacklog', 'recheckLeft']) {
+                    runStats[name] += Number(payload.stats[name]) || 0;
+                }
+                for (const [reason, count] of Object.entries(payload.stats.reasons || {})) runStats.reasons[reason] = (runStats.reasons[reason] || 0) + (Number(count) || 0);
             }
         } catch (e) {}
     }
@@ -153,11 +167,13 @@ async function main() {
         totalPlayable: merged.totalPlayable,
         movieCount: merged.movieCount,
         tvCount: merged.tvCount,
+        deepVerified: merged.deepVerified,
         episodeVerdicts: merged.episodeVerdicts,
+        // Catch-up health: recheckLeft > 0 for several runs in a row means re-verification is falling behind.
         lastRun: runStats
     }, null, 2));
 
-    console.log(`Merged catalogue ready: ${merged.totalPlayable} playable titles (${merged.movieCount} movies, ${merged.tvCount} series, ${merged.episodeVerdicts} verified episodes).`);
+    console.log(`Merged catalogue ready: ${merged.totalPlayable} playable titles (${merged.movieCount} movies, ${merged.tvCount} series, ${merged.deepVerified} deep-verified, ${merged.episodeVerdicts} verified episodes). Re-check backlog ${runStats.recheckBacklog}, left ${runStats.recheckLeft}.`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
