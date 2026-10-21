@@ -127,3 +127,10 @@ test('watchdog: flags persistent overdue backlog and sudden catalogue collapse, 
     const collapse = { history: [{ overdueLeft: 0, total: 36000 }, { overdueLeft: 0, total: 20000 }], plan: { health: 'ok' } };
     assert.match(assess(collapse).problems[0], /shrank 44%/);
 });
+
+import { stampAddedAt } from './merge-catalogue.mjs';
+test('added_at: long-standing titles never flood "New on AsooGak"; genuinely new titles are stamped', () => {
+    const items = [{ id: 1, media_type: 'movie', availability_at: 500 }, { id: 2, media_type: 'movie', availability_at: 600 }, { id: 3, media_type: 'tv', availability_at: 700 }];
+    stampAddedAt(items, [{ id: 1, media_type: 'movie' }, { id: 3, media_type: 'tv', added_at: 400 }]);
+    assert.deepEqual(items.map(i => i.added_at), [1, 600, 400]);
+});

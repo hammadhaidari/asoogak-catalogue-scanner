@@ -130,6 +130,21 @@ export function mergeCatalogueSources(sources, now = Date.now()) {
     };
 }
 
+/* added_at = when a title first became playable on AsooGak (drives the TV's "New on AsooGak" row). It survives every
+   merge; titles already listed before this field existed get 1 ("long-standing") so they never flood the row, and only
+   titles that genuinely join the catalogue (or return after being evicted) are stamped with their verification time. */
+export function stampAddedAt(items, previousItems) {
+    const previous = new Map();
+    for (const item of (Array.isArray(previousItems) ? previousItems : [])) {
+        if (item && item.id && item.media_type) previous.set(item.media_type + ':' + item.id, Number(item.added_at) || 1);
+    }
+    for (const item of items) {
+        const key = item.media_type + ':' + item.id;
+        item.added_at = previous.has(key) ? previous.get(key) : (Number(item.added_at) || item.availability_at || Date.now());
+    }
+    return items;
+}
+
 async function main() {
     const now = Date.now();
     const existingGitHub = await fetchJsonSafe(EXISTING_CATALOGUE_URL);
@@ -160,6 +175,7 @@ async function main() {
     let plan = null;
     try { plan = JSON.parse(process.env.PLAN_JSON || 'null'); } catch (e) {}
     const merged = mergeCatalogueSources([cloudflareData, existingGitHub, ...shardPayloads], now);
+    stampAddedAt(merged.items, existingGitHub && existingGitHub.items);
 
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     fs.writeFileSync(path.join(OUTPUT_DIR, 'catalogue.json'), JSON.stringify(merged));
