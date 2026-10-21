@@ -521,15 +521,27 @@ async function runShard() {
 
     // One probe with patience: a 429 waits out the shared cooldown and retries the SAME key (it used to be dropped for the
     // whole run), a network hiccup retries once. Only a definitive answer is ever recorded.
+    /* Adaptive resolver pacing (AIMD), shared by all workers on this runner's IP: the first deep run spent most of its
+       time in 429 cooldowns (1,610 refusals). Each refusal widens the gap between resolver calls; each success narrows
+       it, so every shard settles just under the provider's per-IP limit instead of hammering it and stalling. */
+    let resolverGapMs = 1500, nextResolverAt = 0;
+    async function resolverSlot() {
+        const wait = Math.max(nextResolverAt, cooldownUntil) - Date.now();
+        nextResolverAt = Math.max(Date.now(), nextResolverAt) + resolverGapMs;
+        if (wait > 0) await sleep(wait);
+    }
     async function probe(key, expect) {
         for (let attempt = 0; attempt < 4 && timeLeft() > 15000; attempt++) {
-            if (cooldownUntil > Date.now()) await sleep(Math.min(20000, cooldownUntil - Date.now()));
+            await resolverSlot();
             const verdict = await verifyStreamKey(key, RESOLVER_KEY, expect);
             if (verdict.rateLimited) {
                 stats.rateLimited++;
-                cooldownUntil = Math.max(cooldownUntil, Date.now() + 8000 + attempt * 6000);
+                resolverGapMs = Math.min(10000, Math.round(resolverGapMs * 1.6));
+                cooldownUntil = Math.max(cooldownUntil, Date.now() + 6000 + attempt * 4000);
                 continue;
             }
+            resolverGapMs = Math.max(600, Math.round(resolverGapMs * 0.95));
+            stats.resolverGapMs = resolverGapMs;
             if (typeof verdict.ok === 'boolean') {
                 if (!verdict.ok && verdict.reason) stats.reasons[verdict.reason] = (stats.reasons[verdict.reason] || 0) + 1;
                 return verdict;
@@ -573,7 +585,10 @@ async function runShard() {
         let unknown = 0;
         for (const season of seasons) {
             if (timeLeft() < 20000) return null; // never publish a half-checked show; it is retried next run
-            const episodes = season.last > 1 ? [1, season.last] : [1];
+            // One probe per season (episode 1); the season that is airing now also proves its newest episode. This halves
+            // resolver calls versus first+last for every season while still catching dead seasons and broken new episodes.
+            const airing = details.last_episode_to_air && details.last_episode_to_air.season_number === season.number;
+            const episodes = airing && season.last > 1 ? [1, season.last] : [1];
             let seasonOk = true, seasonUnknown = false;
             for (const episode of episodes) {
                 const epKey = task.key + ':s' + season.number + ':e' + episode;
@@ -582,7 +597,6 @@ async function runShard() {
                 outputRecords[epKey] = { ok: verdict.ok, at: Date.now(), v: VERIFY_VERSION };
                 if (verdict.ok) stats.episodesVerified++;
                 else { seasonOk = false; break; }
-                await sleep(CHECK_PACE_MS);
             }
             stats.seasonsChecked++;
             if (seasonUnknown) {

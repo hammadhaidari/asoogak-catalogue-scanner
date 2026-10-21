@@ -5,7 +5,7 @@ Multi-IP GitHub Actions verification engine for the AsooGak Smart TV:
 - **Watchdog:** `watchdog.mjs` opens an auto-managed GitHub issue (emails you) if re-checks stay overdue for 4+ runs, capacity runs out, or the catalogue collapses, and closes it when healthy.
 - **Deep verification (v2):** resolver → manifest → real init + first media segment bytes (MP4/TS signatures), plus an
   identity check (stream length vs TMDB runtime, release-name year and SxxEyy) so wrong films and trailers are rejected.
-- **Every aired season verified:** the first and latest aired episode of each season must play; only those seasons are
+- **Every aired season verified:** episode 1 of every aired season (plus the newest episode of the airing season) must play; resolver calls are paced adaptively (AIMD) under the per-IP limit; only those seasons are
   published as `playable_seasons`, and a series with none is not listed.
 - **Daily re-verification, oldest first:** titles never deep-verified go first; any title not re-proven within 3 days is
   evicted. `scanner-state.json → lastRun.recheckLeft` > 0 for several runs means re-checks are falling behind.
