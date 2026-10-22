@@ -108,10 +108,30 @@ jobs:
       - name: Install dependencies
         run: npm install --no-audit --no-fund
 
+      # A flaky artifact download used to throw away a whole run (16 shards x 20 min of verified work) because the merge
+      # job never retried. Try the standard action once, then fall back to the CLI with backoff.
       - name: Download All Shard Artifacts
+        id: download
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: Retry Shard Artifact Download
+        if: steps.download.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            rm -rf artifacts
+            if gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifacts; then
+              echo "Downloaded on attempt $attempt"
+              exit 0
+            fi
+            sleep $((attempt * 20))
+          done
+          echo "Artifact download failed after 5 attempts" >&2
+          exit 1
 
       - name: Merge Shards with Cloudflare & Existing Catalogue
         env:

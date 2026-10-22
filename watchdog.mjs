@@ -17,6 +17,13 @@ export function assess(state) {
     const shrink = lastTwo.length === 2 && lastTwo[0].total > 1000 ? 1 - lastTwo[1].total / lastTwo[0].total : 0;
     const problems = [];
     if (behindRuns >= 4) problems.push(`Overdue re-checks for ${behindRuns} consecutive runs (latest: ${history.at(-1).overdueLeft} titles still overdue).`);
+    // Proof age is what viewers actually feel: titles listed on a proof older than a day are the ones that turn out unplayable.
+    // Alert only when two runs in a row show it, so one slow run does not page anyone.
+    const aged = history.slice(-2).filter(run => Number(run.hotP95h) > 20 || Number(run.p95h) > 36);
+    if (aged.length === 2) {
+        const proof = state.proofAge || {};
+        problems.push(`Listed titles are running on stale proof: popular-title p95 ${proof.hotP95h ?? aged[1].hotP95h}h (target 8h), overall p95 ${proof.p95h ?? aged[1].p95h}h, ${proof.over24h ?? aged[1].over24h} titles older than 24h.`);
+    }
     if (plan.health === 'over-capacity') problems.push(`Demand ${plan.demandHours} worker-hours/day exceeds capacity ${plan.capacityHours} even at ${plan.shards} shards with a 60h tail.`);
     if (shrink > 0.15) problems.push(`Catalogue shrank ${(shrink * 100).toFixed(0)}% in one run (${lastTwo[0].total} → ${lastTwo[1].total}); likely a provider/scanner outage.`);
     return { problems, behindRuns, plan };
@@ -34,7 +41,8 @@ if (import.meta.url === `file://${process.argv[1]}`) {
         const summary = [
             `Catalogue: ${state.totalPlayable} titles (${state.movieCount} movies, ${state.tvCount} series), ${state.deepVerified ?? 0} deep-verified.`,
             `Plan: ${plan.shards} shards, utilization ${plan.utilization}, health \`${plan.health}\`, tail re-check ${Math.round((plan.recheckAgeTailMs || 0) / 3600000)}h.`,
-            `Last run: re-checked ${state.lastRun?.rechecked}, evicted ${state.lastRun?.evicted}, overdue left ${state.lastRun?.overdueLeft}.`
+            `Last run: re-checked ${state.lastRun?.rechecked} due + ${state.lastRun?.proactive ?? 0} rolling, evicted ${state.lastRun?.evicted}, overdue left ${state.lastRun?.overdueLeft}.`,
+            `Proof age: median ${state.proofAge?.p50h ?? '?'}h, p95 ${state.proofAge?.p95h ?? '?'}h, popular p95 ${state.proofAge?.hotP95h ?? '?'}h.`
         ].join('\n');
         if (problems.length) {
             const body = '### Problems\n- ' + problems.join('\n- ') + '\n\n### Status\n' + summary +

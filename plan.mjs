@@ -22,7 +22,19 @@ export function planCapacity(state = {}, popularity = [], options = {}) {
     const scanSeconds = (options.scanMs || 1200000) / 1000;
     const workers = options.workers || 3;
     const runsPerDay = options.runsPerDay || 40;        // cron is every 30 min; GitHub delays some runs
-    const efficiency = options.efficiency || 0.75;      // 429 cooldowns, TMDB calls, startup
+
+    // Efficiency is MEASURED, not assumed: busy worker-seconds over available worker-seconds in the last run. The provider
+    // throttles each runner IP (429s stretched resolver gaps to ~9.5s), so the old fixed 0.75 promised ~2x the capacity the
+    // fleet really delivered and the plan said "ok" while the library drifted stale. Smoothed, and bounded so one odd run
+    // cannot swing the fleet.
+    const lastRun = state.lastRun || {};
+    const available = (Number(lastRun.shardsMerged) || 0) * workers * scanSeconds;
+    const busy = ((Number(lastRun.movieWorkMs) || 0) + (Number(lastRun.tvWorkMs) || 0)) / 1000;
+    const measuredEfficiency = available > 0 && busy > 0 ? Math.min(0.75, busy / available) : null;
+    const learnedEfficiency = Number(state.plan && state.plan.efficiency) || 0;
+    const smoothedEfficiency = measuredEfficiency === null ? (learnedEfficiency || 0.5)
+        : learnedEfficiency ? learnedEfficiency * 0.7 + measuredEfficiency * 0.3 : measuredEfficiency;
+    const efficiency = options.efficiency || Math.max(0.2, Math.min(0.75, smoothedEfficiency));
     const fastAgeMs = options.fastAgeMs || 24 * HOUR;
 
     const last = state.lastRun || {};
@@ -77,6 +89,7 @@ export function planCapacity(state = {}, popularity = [], options = {}) {
         shards, matrix: Array.from({ length: shards }, (_, i) => i),
         recheckAgeMs: fastAgeMs, recheckAgeTailMs: tailAgeMs, popularMin,
         costs: { movie: Number(costs.movie.toFixed(2)), tv: Number(costs.tv.toFixed(2)) },
+        efficiency: Number(efficiency.toFixed(3)),
         demandHours: Math.round(demand / 3600), capacityHours: Math.round(capacity / 3600),
         utilization: Number(utilization.toFixed(2)), behindRuns, health
     };

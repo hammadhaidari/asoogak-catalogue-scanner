@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { looksLikeMedia, isoDurationSeconds, dashPlan, identityVerdict, airedSeasons, VERIFY_VERSION } from './scan-shard.mjs';
-import { mergeCatalogueSources } from './merge-catalogue.mjs';
+import { looksLikeMedia, isoDurationSeconds, dashPlan, identityVerdict, airedSeasons, VERIFY_VERSION, targetAgeFor, buildRecheckQueue, HOT_AGE_MS, PROACTIVE_MIN_AGE_MS } from './scan-shard.mjs';
+import { mergeCatalogueSources, proofAgeStats } from './merge-catalogue.mjs';
 
 const box = type => { const b = Buffer.alloc(4096); b.write(type, 4, 'latin1'); return b; };
 
@@ -133,4 +133,63 @@ test('added_at: long-standing titles never flood "New on AsooGak"; genuinely new
     const items = [{ id: 1, media_type: 'movie', availability_at: 500 }, { id: 2, media_type: 'movie', availability_at: 600 }, { id: 3, media_type: 'tv', availability_at: 700 }];
     stampAddedAt(items, [{ id: 1, media_type: 'movie' }, { id: 3, media_type: 'tv', added_at: 400 }]);
     assert.deepEqual(items.map(i => i.added_at), [1, 600, 400]);
+});
+
+const H = 3600000;
+test('freshness tiers: popular titles are re-proven every 8h, the rest on the plan age', () => {
+    assert.equal(targetAgeFor({ popularity: 80 }, 0, 24 * H, 24 * H), HOT_AGE_MS);
+    assert.equal(targetAgeFor({ popularity: 3 }, 0, 24 * H, 24 * H), 24 * H);
+    assert.equal(targetAgeFor({ popularity: 3 }, 10, 24 * H, 48 * H), 48 * H);   // plan stretches only the unpopular tail
+    assert.equal(targetAgeFor({ popularity: 80 }, 10, 24 * H, 48 * H), HOT_AGE_MS);
+});
+
+test('rolling recheck queue: oldest-relative-to-tier first, recent proofs left alone, no wave when everything shares one age', () => {
+    const now = 1_000_000 * H;
+    const mk = (id, popularity, ageH, deep = true) => [`movie:${id}`, { id, media_type: 'movie', popularity, verified_v: deep ? VERIFY_VERSION : 1, availability_at: now - ageH * H }];
+    const items = [mk(1, 90, 9), mk(2, 1, 20), mk(3, 90, 2), mk(4, 1, 30), mk(5, 1, 7), mk(6, 90, 5, false)];
+    const records = Object.fromEntries(items.map(([key, item]) => [key, { ok: true, at: item.availability_at, v: 2 }]));
+    const queue = buildRecheckQueue(items, records, now, 0, 1);
+    assert.deepEqual(queue.map(task => task.metadata.id), [6, 4, 1, 2, 5]);      // never-deep first, then 30h/24h, 9h/8h, 20h/24h, 7h/24h
+    assert.ok(!queue.some(task => task.metadata.id === 3), 'a title proven 2h ago is not re-checked');
+    assert.equal(queue.find(task => task.metadata.id === 1).proactive, false);   // hot title past its 8h target is due, not just rolling
+    assert.equal(queue.find(task => task.metadata.id === 5).proactive, true);    // 7h-old tail title is only rolling refresh
+    // A catch-up burst leaves 12,000 titles at the same age: the queue still orders them, and spare capacity drains it in
+    // popularity-tier order rather than waiting for a single due time.
+    const herd = Array.from({ length: 12000 }, (_, i) => mk(100 + i, i % 7, 14));
+    const herdQueue = buildRecheckQueue(herd, Object.fromEntries(herd.map(([k, v]) => [k, { ok: true, at: v.availability_at, v: 2 }])), now, 0, 1);
+    assert.equal(herdQueue.length, 12000);
+    assert.ok(herdQueue[0].stale >= herdQueue.at(-1).stale);
+    assert.equal(PROACTIVE_MIN_AGE_MS, 6 * H);
+});
+
+test('proof age telemetry reports overall and popular-title percentiles', () => {
+    const now = 500 * H;
+    const items = Array.from({ length: 100 }, (_, i) => ({ popularity: i < 10 ? 50 : 1, availability_at: now - (i + 1) * H }));
+    const stats = proofAgeStats(items, now, 15);
+    assert.equal(stats.hotTitles, 10);
+    assert.equal(stats.hotMaxh, 10);
+    assert.equal(stats.maxh, 100);
+    assert.equal(stats.over24h, 76);
+    assert.equal(stats.over48h, 52);
+    assert.ok(stats.p50h > 40 && stats.p50h < 60);
+    assert.deepEqual(proofAgeStats([], now).p95h, 0);
+});
+
+test('planner learns real efficiency from busy vs available worker time, never above the old 0.75 assumption', () => {
+    const busyRun = { shardsMerged: 16, movieWorkMs: 16874991, tvWorkMs: 4144817, movieTasks: 950, tvTasks: 130 };   // measured Oct 21: 36% busy
+    const plan = planCapacity({ movieCount: 32578, tvCount: 8142, lastRun: busyRun }, []);
+    assert.ok(plan.efficiency > 0.3 && plan.efficiency < 0.45, 'efficiency ' + plan.efficiency);
+    assert.equal(plan.shards, MAX_SHARDS, 'a throttled fleet scales up to every available shard');
+    const idealRun = { shardsMerged: 16, movieWorkMs: 16 * 3 * 1200000 * 0.95, tvWorkMs: 0 };
+    assert.equal(planCapacity({ movieCount: 100, tvCount: 10, lastRun: idealRun }, []).efficiency, 0.75);
+    assert.equal(planCapacity({ movieCount: 100, tvCount: 10 }, []).efficiency, 0.5);       // nothing measured yet
+});
+
+test('watchdog: stale proof on popular titles for two runs in a row is flagged, one slow run is not', () => {
+    const fine = { history: [{ overdueLeft: 0, total: 40000, hotP95h: 9, p95h: 22 }, { overdueLeft: 0, total: 40000, hotP95h: 10, p95h: 24 }], plan: { health: 'ok' } };
+    assert.equal(assess(fine).problems.length, 0);
+    const oneSlow = { history: [{ overdueLeft: 0, total: 40000, hotP95h: 9, p95h: 22 }, { overdueLeft: 0, total: 40000, hotP95h: 30, p95h: 40 }], plan: { health: 'ok' } };
+    assert.equal(assess(oneSlow).problems.length, 0);
+    const stale = { proofAge: { hotP95h: 31, p95h: 44, over24h: 9000 }, history: [{ overdueLeft: 0, total: 40000, hotP95h: 28, p95h: 40 }, { overdueLeft: 0, total: 40000, hotP95h: 31, p95h: 44 }], plan: { health: 'ok' } };
+    assert.match(assess(stale).problems[0], /stale proof: popular-title p95 31h/);
 });

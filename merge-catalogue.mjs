@@ -145,6 +145,27 @@ export function stampAddedAt(items, previousItems) {
     return items;
 }
 
+/* How old the proof behind what the TV lists really is. This, not the re-check backlog, is the number that decides how
+   many dead titles anyone sees: hot = the most popular titles (what rails and search surface first). */
+export function proofAgeStats(items, now = Date.now(), hotPopularity = Number(process.env.HOT_POPULARITY || 15)) {
+    const HOUR = 3600000;
+    const pct = (sorted, p) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))] : 0;
+    const ages = [], hot = [];
+    for (const item of items) {
+        const age = Math.max(0, now - (Number(item.availability_at) || 0)) / HOUR;
+        ages.push(age);
+        if ((Number(item.popularity) || 0) >= hotPopularity) hot.push(age);
+    }
+    ages.sort((a, b) => a - b);
+    hot.sort((a, b) => a - b);
+    const round = value => Math.round(value * 10) / 10;
+    return {
+        p50h: round(pct(ages, 0.5)), p95h: round(pct(ages, 0.95)), maxh: round(ages.at(-1) || 0),
+        over24h: ages.filter(age => age > 24).length, over48h: ages.filter(age => age > 48).length,
+        hotTitles: hot.length, hotP50h: round(pct(hot, 0.5)), hotP95h: round(pct(hot, 0.95)), hotMaxh: round(hot.at(-1) || 0)
+    };
+}
+
 async function main() {
     const now = Date.now();
     const existingGitHub = await fetchJsonSafe(EXISTING_CATALOGUE_URL);
@@ -154,7 +175,7 @@ async function main() {
     const shardFiles = findShardFiles(ARTIFACTS_DIR);
     const shardPayloads = [];
     const shardCursors = { ...(prevState.shardCursors || {}) };
-    const runStats = { shardsMerged: shardFiles.length, checked: 0, verified: 0, failed: 0, rechecked: 0, evicted: 0, episodesVerified: 0, seasonsChecked: 0, seasonsDead: 0, rateLimited: 0, recheckBacklog: 0, recheckLeft: 0, overdueLeft: 0, movieTasks: 0, movieWorkMs: 0, tvTasks: 0, tvWorkMs: 0, reasons: {} };
+    const runStats = { shardsMerged: shardFiles.length, checked: 0, verified: 0, failed: 0, rechecked: 0, proactive: 0, evicted: 0, episodesVerified: 0, seasonsChecked: 0, seasonsDead: 0, rateLimited: 0, recheckBacklog: 0, recheckLeft: 0, overdueLeft: 0, movieTasks: 0, movieWorkMs: 0, tvTasks: 0, tvWorkMs: 0, reasons: {} };
 
     for (const file of shardFiles) {
         try {
@@ -164,7 +185,7 @@ async function main() {
                 shardCursors[payload.shard] = payload.nextCursor;
             }
             if (payload.stats) {
-                for (const name of ['checked', 'verified', 'failed', 'rechecked', 'evicted', 'episodesVerified', 'seasonsChecked', 'seasonsDead', 'rateLimited', 'recheckBacklog', 'recheckLeft', 'overdueLeft', 'movieTasks', 'movieWorkMs', 'tvTasks', 'tvWorkMs']) {
+                for (const name of ['checked', 'verified', 'failed', 'rechecked', 'proactive', 'evicted', 'episodesVerified', 'seasonsChecked', 'seasonsDead', 'rateLimited', 'recheckBacklog', 'recheckLeft', 'overdueLeft', 'movieTasks', 'movieWorkMs', 'tvTasks', 'tvWorkMs']) {
                     runStats[name] += Number(payload.stats[name]) || 0;
                 }
                 for (const [reason, count] of Object.entries(payload.stats.reasons || {})) runStats.reasons[reason] = (runStats.reasons[reason] || 0) + (Number(count) || 0);
@@ -176,6 +197,7 @@ async function main() {
     try { plan = JSON.parse(process.env.PLAN_JSON || 'null'); } catch (e) {}
     const merged = mergeCatalogueSources([cloudflareData, existingGitHub, ...shardPayloads], now);
     stampAddedAt(merged.items, existingGitHub && existingGitHub.items);
+    const proofAge = proofAgeStats(merged.items, now);
 
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
     fs.writeFileSync(path.join(OUTPUT_DIR, 'catalogue.json'), JSON.stringify(merged));
@@ -187,19 +209,21 @@ async function main() {
         tvCount: merged.tvCount,
         deepVerified: merged.deepVerified,
         episodeVerdicts: merged.episodeVerdicts,
+        proofAge,
         // Catch-up health: overdueLeft > 0 for several runs in a row means re-verification is falling behind.
         lastRun: runStats,
         // Rolling history + learned per-title costs feed plan.mjs (auto-scaling) and the watchdog issue.
         costs: plan && plan.costs ? plan.costs : (prevState.costs || null),
         plan: plan || null,
         history: [...(Array.isArray(prevState.history) ? prevState.history : []), {
-            at: now, shards: runStats.shardsMerged, checked: runStats.checked, rechecked: runStats.rechecked,
+            at: now, shards: runStats.shardsMerged, checked: runStats.checked, rechecked: runStats.rechecked, proactive: runStats.proactive,
             evicted: runStats.evicted, recheckLeft: runStats.recheckLeft, overdueLeft: runStats.overdueLeft,
-            total: merged.totalPlayable, deep: merged.deepVerified
+            total: merged.totalPlayable, deep: merged.deepVerified,
+            p50h: proofAge.p50h, p95h: proofAge.p95h, hotP95h: proofAge.hotP95h, over24h: proofAge.over24h
         }].slice(-48)
     }, null, 2));
 
-    console.log(`Merged catalogue ready: ${merged.totalPlayable} playable titles (${merged.movieCount} movies, ${merged.tvCount} series, ${merged.deepVerified} deep-verified, ${merged.episodeVerdicts} verified episodes). Re-check backlog ${runStats.recheckBacklog}, left ${runStats.recheckLeft}.`);
+    console.log(`Merged catalogue ready: ${merged.totalPlayable} playable titles (${merged.movieCount} movies, ${merged.tvCount} series, ${merged.deepVerified} deep-verified, ${merged.episodeVerdicts} verified episodes). Re-check backlog ${runStats.recheckBacklog}, left ${runStats.recheckLeft}. Proof age: median ${proofAge.p50h}h, p95 ${proofAge.p95h}h, popular p95 ${proofAge.hotP95h}h, ${proofAge.over24h} older than 24h.`);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

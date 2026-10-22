@@ -14,6 +14,39 @@ const POPULAR_MIN = Number(process.env.POPULAR_MIN || 0);
 export function recheckAgeFor(item, popularMin = POPULAR_MIN, fast = RECHECK_AGE_MS, tail = RECHECK_AGE_TAIL_MS) {
     return (Number(item && item.popularity) || 0) >= popularMin ? fast : tail;
 }
+
+/* Freshness tiers. What people actually browse (the top ~3,000 titles by popularity) is re-proven every 8h; a title's
+   proof is at most a day old for the rest. About 3 in 100 listed titles lose their stream within a day, so the shorter the
+   proof age on what is on screen, the fewer dead titles anyone ever sees. */
+export const HOT_POPULARITY = Number(process.env.HOT_POPULARITY || 15);
+export const HOT_AGE_MS = Math.max(4 * 3600000, Number(process.env.HOT_AGE_MS || 8 * 3600000));
+// Titles proven less than this long ago are never re-checked just to keep busy.
+export const PROACTIVE_MIN_AGE_MS = Math.max(3 * 3600000, Number(process.env.PROACTIVE_MIN_AGE_MS || 6 * 3600000));
+export function targetAgeFor(item, popularMin = POPULAR_MIN, fast = RECHECK_AGE_MS, tail = RECHECK_AGE_TAIL_MS, hotPopularity = HOT_POPULARITY, hotAge = HOT_AGE_MS) {
+    const base = recheckAgeFor(item, popularMin, fast, tail);
+    return (Number(item && item.popularity) || 0) >= hotPopularity ? Math.min(base, hotAge) : base;
+}
+
+/* Rolling re-verification queue for one shard. Instead of waiting for every title to cross its due time (which, after any
+   catch-up burst, makes the whole library come due in the same few hours), every title older than PROACTIVE_MIN_AGE_MS is
+   queued, most stale first relative to its own tier: age / target age. Due and overdue titles therefore always lead, hot
+   titles lead their tail neighbours, and spare capacity keeps flattening the age curve so no wave ever builds again.
+   Never deep-verified titles (lastAt 0) go before everything. */
+export function buildRecheckQueue(items, records, now, shard, shardTotal, options = {}) {
+    const minAge = options.minAge ?? PROACTIVE_MIN_AGE_MS;
+    const queue = [];
+    for (const [key, item] of items) {
+        if (hashKey(key) % shardTotal !== shard) continue;
+        const deep = item.verified_v >= VERIFY_VERSION;
+        const lastAt = deep ? ((records[key] && records[key].at) || item.availability_at || 0) : 0;
+        const target = targetAgeFor(item, options.popularMin, options.fast, options.tail);
+        const dueAt = lastAt + target;
+        if (lastAt !== 0 && now - lastAt < minAge) continue;
+        queue.push({ key, metadata: item, isRecheck: true, lastAt, dueAt, proactive: now < dueAt, stale: lastAt === 0 ? Infinity : (now - lastAt) / target });
+    }
+    queue.sort((a, b) => b.stale - a.stale || a.dueAt - b.dueAt);
+    return queue;
+}
 const NEGATIVE_RECHECK_MS = 72 * 3600000;
 const WORKER_CONCURRENCY = Math.max(1, Number(process.env.WORKER_CONCURRENCY || 3));
 const CHECK_PACE_MS = Math.max(250, Number(process.env.CHECK_PACE_MS || 600));
@@ -455,25 +488,16 @@ async function runShard() {
     let cursor = Number(scannerState.shardCursors?.[SHARD_INDEX]) || (SHARD_INDEX + 1);
     const outputRecords = {};
     const outputItems = {};
-    const stats = { shard: SHARD_INDEX, checked: 0, verified: 0, failed: 0, rechecked: 0, evicted: 0, episodesVerified: 0, seasonsChecked: 0, seasonsDead: 0, rateLimited: 0, recheckBacklog: 0, recheckLeft: 0, overdueLeft: 0,
+    const stats = { shard: SHARD_INDEX, checked: 0, verified: 0, failed: 0, rechecked: 0, proactive: 0, evicted: 0, episodesVerified: 0, seasonsChecked: 0, seasonsDead: 0, rateLimited: 0, recheckBacklog: 0, recheckLeft: 0, overdueLeft: 0,
         movieTasks: 0, movieWorkMs: 0, tvTasks: 0, tvWorkMs: 0, reasons: {} };
 
     // 1. Collect stale titles assigned to this shard for rolling freshness re-verification. Titles that were never
     //    deep-verified (older scanner: manifest-only, season 1 only) go first, then the most overdue, so the backlog
     //    is provably drained instead of re-checking whatever happens to be at the head of the map.
     const now = Date.now();
-    const recheckQueue = [];
-    for (const [key, item] of knownItemsMap.entries()) {
-        if (hashKey(key) % SHARD_TOTAL !== SHARD_INDEX) continue;
-        const deep = item.verified_v >= VERIFY_VERSION;
-        const lastAt = deep ? (knownRecords[key]?.at || item.availability_at || 0) : 0;
-        const dueAt = lastAt + recheckAgeFor(item);
-        if (now >= dueAt) {
-            recheckQueue.push({ key, metadata: item, isRecheck: true, lastAt, dueAt });
-        }
-    }
-    recheckQueue.sort((a, b) => a.dueAt - b.dueAt);
-    stats.recheckBacklog = recheckQueue.length;
+    const recheckQueue = buildRecheckQueue(knownItemsMap.entries(), knownRecords, now, SHARD_INDEX, SHARD_TOTAL);
+    // Backlog = titles actually due; the rest of the queue is rolling (proactive) refresh that runs on spare capacity.
+    stats.recheckBacklog = recheckQueue.filter(task => !task.proactive).length;
     // Overdue = never deep-verified or more than 6h past due. While any exist, every worker re-checks (discovery waits):
     // keeping listed titles honest always outranks adding new ones, so growth can never starve re-verification.
     const isOverdue = task => task.lastAt === 0 || now - task.dueAt > 6 * 3600000;
@@ -621,6 +645,7 @@ async function runShard() {
     }
 
     async function workerLoop(workerId) {
+        let emptyPulls = 0;
         while (timeLeft() > 15000) {
             if (cooldownUntil > Date.now()) {
                 await sleep(Math.min(5000, cooldownUntil - Date.now()));
@@ -637,9 +662,15 @@ async function runShard() {
             }
             if (!task) {
                 await pullMoreCandidates();
-                if (!discoveryQueue.length && !recheckQueue.length) break;
+                if (!discoveryQueue.length && !recheckQueue.length) {
+                    // A TMDB hiccup used to end this worker for the whole run (one shard finished after 70s); keep
+                    // trying fresh feed pages until the scan window closes, giving up only after a long dry streak.
+                    if (++emptyPulls > 60) break;
+                    await sleep(1500);
+                }
                 continue;
             }
+            emptyPulls = 0;
 
             const taskStarted = Date.now();
             const isShow = task.key.startsWith('tv:');
@@ -652,7 +683,8 @@ async function runShard() {
             if (typeof result === 'boolean') {
                 stats.checked++;
                 if (task.isRecheck) {
-                    stats.rechecked++;
+                    if (task.proactive) stats.proactive++;
+                    else stats.rechecked++;
                     if (!result) stats.evicted++;
                 }
                 if (result) stats.verified++;
@@ -663,7 +695,7 @@ async function runShard() {
     }
 
     await Promise.all(Array.from({ length: WORKER_CONCURRENCY }, (_, idx) => workerLoop(idx)));
-    stats.recheckLeft = recheckQueue.length; // > 0 means re-verification is NOT keeping up; surfaced in scanner-state.json
+    stats.recheckLeft = recheckQueue.filter(task => !task.proactive && now >= task.dueAt).length; // > 0 means re-verification is NOT keeping up; surfaced in scanner-state.json
     stats.overdueLeft = recheckQueue.filter(isOverdue).length;
 
     const outPath = `shard-output-${SHARD_INDEX}.json`;
