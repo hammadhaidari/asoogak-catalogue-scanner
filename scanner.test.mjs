@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { looksLikeMedia, isoDurationSeconds, dashPlan, identityVerdict, airedSeasons, VERIFY_VERSION, targetAgeFor, buildRecheckQueue, HOT_AGE_MS, PROACTIVE_MIN_AGE_MS } from './scan-shard.mjs';
+import { looksLikeMedia, isoDurationSeconds, dashPlan, identityVerdict, airedSeasons, VERIFY_VERSION, targetAgeFor, buildRecheckQueue, HOT_AGE_MS, PROACTIVE_MIN_AGE_MS, fetchWithFallback, DEFINITIVE_HTTP_STATUSES } from './scan-shard.mjs';
 import { mergeCatalogueSources, proofAgeStats } from './merge-catalogue.mjs';
 
 const box = type => { const b = Buffer.alloc(4096); b.write(type, 4, 'latin1'); return b; };
@@ -192,4 +192,15 @@ test('watchdog: stale proof on popular titles for two runs in a row is flagged, 
     assert.equal(assess(oneSlow).problems.length, 0);
     const stale = { proofAge: { hotP95h: 31, p95h: 44, over24h: 9000 }, history: [{ overdueLeft: 0, total: 40000, hotP95h: 28, p95h: 40 }, { overdueLeft: 0, total: 40000, hotP95h: 31, p95h: 44 }], plan: { health: 'ok' } };
     assert.match(assess(stale).problems[0], /stale proof: popular-title p95 31h/);
+});
+
+test('fetchWithFallback returns definitive HTTP failures (400/401/403/404/410/416/422/428) directly without swallowing or proxying them', async () => {
+    for (const status of DEFINITIVE_HTTP_STATUSES) {
+        const calls = [];
+        const res = await fetchWithFallback('https://cdn.example/seg.m4s', {}, 5000, async url => { calls.push(url); return { ok: false, status, body: { cancel: async () => {} } }; }, ['https://proxy.example/?url=']);
+        assert.equal(res.status, status);
+        assert.equal(calls.length, 1, `status ${status} must not be swallowed or sent to proxy`);
+    }
+    const direct429 = await fetchWithFallback('https://vidlink.pro/api/b/movie/x', {}, 5000, async () => ({ ok: false, status: 429 }), []);
+    assert.equal(direct429.status, 429);
 });

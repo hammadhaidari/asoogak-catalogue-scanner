@@ -48,7 +48,7 @@ jobs:
           # so this scanner runs fewer shards, re-proves deeply every ~48h (retention is 3 days) and spends the rest on discovery.
           MIN_SHARDS: ${{ vars.SCANNER_SHARDS || '10' }}
           MAX_SHARDS: ${{ vars.SCANNER_SHARDS || '10' }}
-          FAST_AGE_MS: ${{ vars.SCANNER_RECHECK_MS || '172800000' }}
+          FAST_AGE_MS: ${{ vars.SCANNER_RECHECK_MS || '86400000' }}
         run: node plan.mjs
       - id: dump
         run: echo "plan_json=$(cat plan.json)" >> "$GITHUB_OUTPUT"
@@ -86,7 +86,7 @@ jobs:
           TMDB_KEY: ${{ secrets.TMDB_KEY }}
           RESOLVER_KEY: ${{ secrets.RESOLVER_KEY }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
-          HOT_AGE_MS: ${{ vars.SCANNER_HOT_MS || '129600000' }}
+          HOT_AGE_MS: ${{ vars.SCANNER_HOT_MS || '28800000' }}
         run: node scan-shard.mjs
 
       - name: Upload Shard Output

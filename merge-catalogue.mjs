@@ -6,7 +6,7 @@ import path from 'node:path';
 const POSITIVE_RETAIN_MS = 3 * 24 * 3600000;
 const NEGATIVE_RETAIN_MS = 72 * 3600000;
 const DEEP_VERSION = 2;
-const AVAILABILITY_API = (process.env.AVAILABILITY_API || 'https://asoogak-availability.cinejoy-tv-3274.workers.dev').trim();
+const AVAILABILITY_API = (process.env.AVAILABILITY_API || '').trim();
 const EXISTING_CATALOGUE_URL = (process.env.EXISTING_CATALOGUE_URL || '').trim();
 const STATE_URL = (process.env.STATE_URL || '').trim();
 const ARTIFACTS_DIR = process.env.ARTIFACTS_DIR || '.';

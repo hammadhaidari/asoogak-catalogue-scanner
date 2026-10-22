@@ -155,16 +155,20 @@ function hashKey(key) {
     return Math.abs(h >>> 0);
 }
 
-async function fetchWithFallback(targetUrl, headers, timeoutMs = 10000) {
+export const DEFINITIVE_HTTP_STATUSES = [400, 401, 403, 404, 410, 416, 422, 428];
+
+export async function fetchWithFallback(targetUrl, headers, timeoutMs = 10000, fetchImpl = fetch, proxies = PROXY_URLS) {
     try {
-        const direct = await fetch(targetUrl, { headers, signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
-        if (direct.ok || direct.status === 206 || direct.status === 404 || direct.status === 410) return direct;
+        const direct = await fetchImpl(targetUrl, { headers, signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
+        if (direct.ok || direct.status === 206 || DEFINITIVE_HTTP_STATUSES.includes(direct.status) || !proxies.length) return direct;
         await direct.body?.cancel();
-    } catch (err) {}
-    if (PROXY_URLS.length) {
-        const proxyBase = PROXY_URLS[proxyCursor++ % PROXY_URLS.length];
+    } catch (err) {
+        if (!proxies.length) throw err;
+    }
+    if (proxies.length) {
+        const proxyBase = proxies[proxyCursor++ % proxies.length];
         const proxied = proxyBase + encodeURIComponent(targetUrl) + '&base=' + encodeURIComponent('https://vidlink.pro');
-        return fetch(proxied, { headers, signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
+        return fetchImpl(proxied, { headers, signal: AbortSignal.timeout(timeoutMs), redirect: 'follow' });
     }
     throw new Error('Request failed');
 }
