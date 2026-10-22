@@ -43,6 +43,12 @@ jobs:
         with:
           node-version: '22'
       - id: plan
+        env:
+          # The verified-feed repo shares this account's ~20 runner slots and owns day-to-day freshness (cheap proofs every 4-24h),
+          # so this scanner runs fewer shards, re-proves deeply every ~48h (retention is 3 days) and spends the rest on discovery.
+          MIN_SHARDS: ${{ vars.SCANNER_SHARDS || '10' }}
+          MAX_SHARDS: ${{ vars.SCANNER_SHARDS || '10' }}
+          FAST_AGE_MS: ${{ vars.SCANNER_RECHECK_MS || '172800000' }}
         run: node plan.mjs
       - id: dump
         run: echo "plan_json=$(cat plan.json)" >> "$GITHUB_OUTPUT"
@@ -80,6 +86,7 @@ jobs:
           TMDB_KEY: ${{ secrets.TMDB_KEY }}
           RESOLVER_KEY: ${{ secrets.RESOLVER_KEY }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
+          HOT_AGE_MS: ${{ vars.SCANNER_HOT_MS || '129600000' }}
         run: node scan-shard.mjs
 
       - name: Upload Shard Output
@@ -159,4 +166,6 @@ jobs:
       - name: Catch-up Watchdog
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WATCHDOG_HOT_P95H: '60'
+          WATCHDOG_P95H: '80'
         run: node watchdog.mjs dist/scanner-state.json

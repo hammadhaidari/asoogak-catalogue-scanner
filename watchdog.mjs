@@ -19,10 +19,12 @@ export function assess(state) {
     if (behindRuns >= 4) problems.push(`Overdue re-checks for ${behindRuns} consecutive runs (latest: ${history.at(-1).overdueLeft} titles still overdue).`);
     // Proof age is what viewers actually feel: titles listed on a proof older than a day are the ones that turn out unplayable.
     // Alert only when two runs in a row show it, so one slow run does not page anyone.
-    const aged = history.slice(-2).filter(run => Number(run.hotP95h) > 20 || Number(run.p95h) > 36);
+    // Thresholds are settings: the scanner repo re-proves deeply every ~48h while the verified-feed repo guards day-to-day freshness.
+    const hotLimit = Number(process.env.WATCHDOG_HOT_P95H) || 20, allLimit = Number(process.env.WATCHDOG_P95H) || 36;
+    const aged = history.slice(-2).filter(run => Number(run.hotP95h) > hotLimit || Number(run.p95h) > allLimit);
     if (aged.length === 2) {
         const proof = state.proofAge || {};
-        problems.push(`Listed titles are running on stale proof: popular-title p95 ${proof.hotP95h ?? aged[1].hotP95h}h (target 8h), overall p95 ${proof.p95h ?? aged[1].p95h}h, ${proof.over24h ?? aged[1].over24h} titles older than 24h.`);
+        problems.push(`Listed titles are running on stale proof: popular-title p95 ${proof.hotP95h ?? aged[1].hotP95h}h (limit ${hotLimit}h), overall p95 ${proof.p95h ?? aged[1].p95h}h, ${proof.over24h ?? aged[1].over24h} titles older than 24h.`);
     }
     if (plan.health === 'over-capacity') problems.push(`Demand ${plan.demandHours} worker-hours/day exceeds capacity ${plan.capacityHours} even at ${plan.shards} shards with a 60h tail.`);
     if (shrink > 0.15) problems.push(`Catalogue shrank ${(shrink * 100).toFixed(0)}% in one run (${lastTwo[0].total} → ${lastTwo[1].total}); likely a provider/scanner outage.`);

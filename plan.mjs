@@ -12,8 +12,9 @@
    3. The health verdict ('ok' | 'tight' | 'behind' | 'over-capacity') drives the watchdog issue in the workflow. */
 import fs from 'node:fs';
 
-export const MIN_SHARDS = 16;
-export const MAX_SHARDS = 20;
+// Both repos (this scanner and the verified feed) run on the same account's ~20 concurrent runner slots, so the split is a setting.
+export const MIN_SHARDS = Math.max(1, Number(process.env.MIN_SHARDS) || 16);
+export const MAX_SHARDS = Math.max(MIN_SHARDS, Number(process.env.MAX_SHARDS) || 20);
 const HOUR = 3600000;
 const DEFAULT_COST = { movie: 6, tv: 25 }; // seconds per title before anything has been measured
 const TAIL_MAX_MS = 60 * HOUR;
@@ -104,7 +105,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     const catalogue = await fetchJson(process.env.EXISTING_CATALOGUE_URL);
     const popularity = (catalogue && Array.isArray(catalogue.items) ? catalogue.items : []).map(item => Number(item.popularity) || 0);
     if (catalogue) { state.movieCount = catalogue.movieCount ?? state.movieCount; state.tvCount = catalogue.tvCount ?? state.tvCount; }
-    const plan = planCapacity(state, popularity, { scanMs: Number(process.env.SCAN_DURATION_MS) || 1200000 });
+    const plan = planCapacity(state, popularity, { scanMs: Number(process.env.SCAN_DURATION_MS) || 1200000, fastAgeMs: Number(process.env.FAST_AGE_MS) || undefined });
     console.log('Capacity plan:', JSON.stringify(plan));
     fs.writeFileSync('plan.json', JSON.stringify(plan));
     const out = process.env.GITHUB_OUTPUT;
